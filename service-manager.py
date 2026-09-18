@@ -23,11 +23,18 @@ SERVICE_SOURCES = [
 ]
 
 SYSTEMD_DIR = Path("/etc/systemd/system")
-STATUS_REFRESH_INTERVAL = 2.0
+STATUS_REFRESH_INTERVAL = 4.0
 SERVICE_LIST_REFRESH_INTERVAL = 10.0
 ERROR_REFRESH_INTERVAL = 10.0
 LOG_REFRESH_INTERVAL = 2.0
 MAX_VISIBLE_SERVICES = 15
+WIDE_FOOTER_MIN_WIDTH = 138
+
+# UI performance tuning. RealVNC/terminal emulators can generate a burst of
+# mouse-wheel events. Do not repaint the entire Rich screen for every event.
+INPUT_POLL_INTERVAL = 0.04
+SCROLL_REDRAW_INTERVAL = 0.08
+BACKGROUND_IDLE_DELAY = 0.25
 
 SYSTEMD_PROPERTIES = [
     "Id",
@@ -55,6 +62,7 @@ status_details = []
 services = []
 service_cache = {}
 service_metadata = {}
+service_relation_cache = {}
 pid_memory_cache = {}
 last_status_refresh = 0.0
 last_service_list_refresh = 0.0
@@ -244,7 +252,7 @@ def load_services():
 
 
 def refresh_service_list(force=False):
-    global services, selected_index, last_service_list_refresh
+    global services, selected_index, last_service_list_refresh, last_status_refresh
     now = time.monotonic()
     if not force and now - last_service_list_refresh < SERVICE_LIST_REFRESH_INTERVAL:
         return False
@@ -252,16 +260,24 @@ def refresh_service_list(force=False):
     previous = None
     if services and 0 <= selected_index < len(services):
         previous = services[selected_index]
+    previous_metadata = service_metadata
     new_services = load_services()
-    changed = new_services != services
+    changed = new_services != services or service_metadata != previous_metadata
     services = new_services
+    if changed:
+        last_status_refresh = 0.0
+        service_relation_cache.clear()
     if not services:
         selected_index = 0
+        if previous is not None:
+            reset_selected_journal_cache()
         return changed
     if previous in services:
         selected_index = services.index(previous)
     else:
         selected_index = min(selected_index, len(services) - 1)
+    if previous != services[selected_index] or changed:
+        reset_selected_journal_cache()
     return changed
 
 
@@ -287,12 +303,14 @@ def refresh_service_data(force=False):
     now = time.monotonic()
     if not force and now - last_status_refresh < STATUS_REFRESH_INTERVAL:
         return False
-    refresh_service_list()
+    list_changed = refresh_service_list()
     last_status_refresh = now
     if not services:
+        changed = bool(service_cache)
         service_cache = {}
+        service_relation_cache.clear()
         pid_memory_cache.clear()
-        return True
+        return changed or list_changed
 
     query_units = list(services)
     for metadata in service_metadata.values():
@@ -326,9 +344,17 @@ def refresh_service_data(force=False):
         for name in info.get("Names", "").split():
             if name.endswith(".service"):
                 cache[name] = info
+    previous_cache = service_cache
+    previous_relations = service_relation_cache.copy()
     service_cache = cache
     refresh_pid_memory()
-    return True
+    for info in {id(info): info for info in cache.values()}.values():
+        info["_MemoryBytes"] = get_service_memory(info)
+    service_relation_cache.clear()
+    service_relation_cache.update(
+        (service, get_service_relation(service)) for service in services
+    )
+    return list_changed or cache != previous_cache or service_relation_cache != previous_relations
 
 
 def get_service_info(service):
@@ -402,21 +428,26 @@ def get_service_relation(service):
     conflict      same unit name points to a different file
     unknown       cannot safely determine
     """
-    selected = get_service_file_path(service)
-    fragment = get_systemd_fragment_path(service)
     info = service_cache.get(service)
 
     if info is None or info.get("LoadState") == "not-found":
         return "not-installed"
+    selected = get_service_file_path(service)
+    fragment = get_systemd_fragment_path(service)
     if selected is None or fragment is None:
         return "unknown"
-    try:
-        if selected.resolve(strict=False) == fragment.resolve(strict=False):
-            return "match"
-    except OSError:
-        if str(selected) == str(fragment):
-            return "match"
+    # Both helpers already resolve their paths.
+    if selected == fragment:
+        return "match"
     return "conflict"
+
+
+def get_display_relation(service):
+    # Rendering uses the latest status snapshot. Actions still resolve paths
+    # afresh through get_service_relation before touching a service.
+    if service in service_relation_cache:
+        return service_relation_cache[service]
+    return get_service_relation(service)
 
 
 def format_exec_start(value):
@@ -454,7 +485,11 @@ def refresh_pid_memory():
         if info_id in seen:
             continue
         seen.add(info_id)
-        if parse_memory(info.get("MemoryCurrent")) is not None:
+        memory = parse_memory(info.get("MemoryCurrent"))
+        if memory is None:
+            memory = get_cgroup_memory(info)
+        info["_MemoryBytes"] = memory
+        if memory is not None:
             continue
         try:
             pid = int(info.get("MainPID", "0"))
@@ -472,6 +507,7 @@ def refresh_pid_memory():
         "ps", "-o", "pid=,rss=", "-p", pid_argument
     ], timeout=5)
     if rc != 0:
+        pid_memory_cache = {}
         return
 
     cache = {}
@@ -500,6 +536,14 @@ def get_cgroup_memory(info):
 
 
 def get_service_memory(info):
+    if "_MemoryBytes" in info:
+        memory = info["_MemoryBytes"]
+        if memory is not None:
+            return memory
+        try:
+            return pid_memory_cache.get(int(info.get("MainPID", "0")))
+        except (TypeError, ValueError):
+            return None
     memory = parse_memory(info.get("MemoryCurrent"))
     if memory is not None:
         return memory
@@ -534,8 +578,7 @@ def reset_selected_journal_cache():
     last_log_refresh = 0.0
     selected_error_text = "Loading..."
     selected_log_text = "Loading..."
-detail_scroll_offset = 0
-log_scroll_offset = 0
+    reset_view_scroll()
 
 
 def refresh_selected_error(force=False):
@@ -546,18 +589,19 @@ def refresh_selected_error(force=False):
     now = time.monotonic()
     if not force and now - last_error_refresh < ERROR_REFRESH_INTERVAL:
         return False
+    previous_text = selected_error_text
     last_error_refresh = now
     service = services[selected_index]
     relation = get_service_relation(service)
     if relation == "conflict":
         selected_error_text = "Not queried: unit name conflicts with another systemd file."
-        return True
+        return selected_error_text != previous_text
     _, stdout, stderr = run_command([
         "journalctl", "-u", service, "-p", "err", "-n", "3",
         "--no-pager", "--output=short"
     ], timeout=5)
     selected_error_text = stdout or stderr or "No recent errors"
-    return True
+    return selected_error_text != previous_text
 
 
 def refresh_selected_logs(force=False):
@@ -567,17 +611,18 @@ def refresh_selected_logs(force=False):
     now = time.monotonic()
     if not force and now - last_log_refresh < LOG_REFRESH_INTERVAL:
         return False
+    previous_text = selected_log_text
     last_log_refresh = now
     service = services[selected_index]
     relation = get_service_relation(service)
     if relation == "conflict":
         selected_log_text = "Logs hidden because this service name resolves to a different systemd file."
-        return True
+        return selected_log_text != previous_text
     _, stdout, stderr = run_command([
         "journalctl", "-u", service, "-n", "20", "--no-pager", "--output=short"
     ], timeout=5)
     selected_log_text = stdout or stderr or "No logs available"
-    return True
+    return selected_log_text != previous_text
 
 
 def run_noninteractive_systemctl(arguments, timeout=15):
@@ -1369,7 +1414,7 @@ def format_start_time(timestamp):
 
 
 def get_state_display(service, info):
-    relation = get_service_relation(service)
+    relation = get_display_relation(service)
     if relation == "conflict":
         return Text("⚠ conflict", style="bold bright_red")
 
@@ -1446,7 +1491,7 @@ def get_max_visible_services():
 
 def get_footer_height():
     width, _ = get_terminal_size_safe()
-    return 2 if width >= 118 else 3
+    return 2 if width >= WIDE_FOOTER_MIN_WIDTH else 3
 
 
 def get_detail_view_height():
@@ -1544,11 +1589,11 @@ def build_service_table():
         expand=True,
         padding=(0, 1),
     )
-    table.add_column("", width=2)
-    table.add_column("Service", ratio=2)
-    table.add_column("Status", width=18)
-    table.add_column("Memory", width=12, justify="right")
-    table.add_column("Link source", ratio=1)
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Service", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("Status", width=18, no_wrap=True)
+    table.add_column("Memory", width=12, justify="right", no_wrap=True)
+    table.add_column("Link source", ratio=1, no_wrap=True, overflow="ellipsis")
 
     start, end = get_visible_range()
     for index in range(start, end):
@@ -1604,7 +1649,7 @@ def build_detail_lines(service):
     """Build all Service Details rows before applying the scroll window."""
 
     info = get_service_info(service)
-    relation = get_service_relation(service)
+    relation = get_display_relation(service)
     state = info.get("ActiveState", "unknown")
     load_state = info.get("LoadState", "unknown")
     startup_state = info.get("UnitFileState", "")
@@ -1827,7 +1872,7 @@ def build_footer():
     footer.append(" Top/Bottom", style="bright_white")
     footer.append("\n")
 
-    if width >= 118:
+    if width >= WIDE_FOOTER_MIN_WIDTH:
         actions = [
             ("[s]", " Start  "),
             ("[x]", " Stop  "),
@@ -1920,12 +1965,16 @@ def parse_escape_sequence(sequence):
     key_map = {
         b"\x1b[A": "UP",
         b"\x1b[B": "DOWN",
+        b"\x1bOA": "UP",
+        b"\x1bOB": "DOWN",
         b"\x1b[5~": "PAGE_UP",
         b"\x1b[6~": "PAGE_DOWN",
         b"\x1b[H": "HOME",
+        b"\x1bOH": "HOME",
         b"\x1b[1~": "HOME",
         b"\x1b[7~": "HOME",
         b"\x1b[F": "END",
+        b"\x1bOF": "END",
         b"\x1b[4~": "END",
         b"\x1b[8~": "END",
     }
@@ -1952,7 +2001,7 @@ def parse_escape_sequence(sequence):
     return "ESC"
 
 
-def read_key(timeout=0.08):
+def read_key(timeout=INPUT_POLL_INTERVAL):
     """Read keyboard keys and SGR mouse-wheel reports from the terminal."""
 
     readable, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -1961,25 +2010,25 @@ def read_key(timeout=0.08):
 
     fd = sys.stdin.fileno()
     first = os.read(fd, 1)
+    if not first:
+        return "q"
 
     if first == b"\x1b":
         sequence = bytearray(first)
         deadline = time.monotonic() + 0.06
 
         while len(sequence) < 64 and time.monotonic() < deadline:
-            # Known keyboard sequences can be returned immediately.
+            # Stop at the end of any CSI/SS3 sequence, including unsupported
+            # keys. Otherwise a following key can be swallowed for 60 ms.
             current = bytes(sequence)
-            if current in {
-                b"\x1b[A", b"\x1b[B",
-                b"\x1b[5~", b"\x1b[6~",
-                b"\x1b[H", b"\x1b[F",
-                b"\x1b[1~", b"\x1b[4~",
-                b"\x1b[7~", b"\x1b[8~",
-            }:
+            if (
+                len(current) >= 3
+                and current[1:2] in {b"[", b"O"}
+                and 0x40 <= current[-1] <= 0x7e
+            ):
                 break
 
-            # Complete SGR mouse sequences end in M or m.
-            if current.startswith(b"\x1b[<") and current[-1:] in {b"M", b"m"}:
+            if len(current) == 2 and current[1:2] not in {b"[", b"O"}:
                 break
 
             remaining = max(0, deadline - time.monotonic())
@@ -1987,7 +2036,10 @@ def read_key(timeout=0.08):
             if not ready:
                 break
 
-            sequence.extend(os.read(fd, 1))
+            part = os.read(fd, 1)
+            if not part:
+                break
+            sequence.extend(part)
 
         return parse_escape_sequence(bytes(sequence))
 
@@ -2221,16 +2273,35 @@ def main():
         enable_mouse_reporting()
 
         running = True
+        ui_dirty = False
+        last_ui_redraw = time.monotonic()
+        last_input_time = 0.0
+        last_terminal_size = get_terminal_size_safe()
+
+        scroll_events = {
+            "WHEEL_UP", "WHEEL_DOWN",
+            "PAGE_UP", "PAGE_DOWN",
+            "HOME", "END",
+        }
 
         while running:
             key = read_key()
+            now = time.monotonic()
+            terminal_size = get_terminal_size_safe()
+            if terminal_size != last_terminal_size:
+                last_terminal_size = terminal_size
+                ui_dirty = True
 
             if key is not None:
+                last_input_time = now
+
                 if key == "D":
                     run_modal_action(
                         live, console, fd, normal_settings,
                         delete_service_wizard,
                     )
+                    ui_dirty = False
+                    last_ui_redraw = time.monotonic()
                     continue
 
                 if (
@@ -2244,10 +2315,45 @@ def main():
                         live, console, fd, normal_settings,
                         create_service_wizard,
                     )
+                    ui_dirty = False
+                    last_ui_redraw = time.monotonic()
                     continue
 
                 running = handle_key(key)
+                if not running:
+                    break
+
+                # Mouse wheels commonly arrive in bursts, especially through
+                # RealVNC. Update the scroll offset for every event, but cap
+                # full-screen Rich redraws. This removes most of the perceived
+                # lag while preserving the final scroll position.
+                if key in scroll_events:
+                    ui_dirty = True
+                    if now - last_ui_redraw >= SCROLL_REDRAW_INTERVAL:
+                        live.update(build_dashboard(), refresh=True)
+                        last_ui_redraw = now
+                        ui_dirty = False
+                elif key == "MOUSE":
+                    # Ignore ordinary mouse button events without repainting.
+                    pass
+                else:
+                    live.update(build_dashboard(), refresh=True)
+                    last_ui_redraw = now
+                    ui_dirty = False
+
+                continue
+
+            # If scroll events were coalesced, draw the newest position once
+            # input becomes quiet instead of repainting once per wheel notch.
+            if ui_dirty:
                 live.update(build_dashboard(), refresh=True)
+                last_ui_redraw = now
+                ui_dirty = False
+                continue
+
+            # Avoid launching systemctl/journalctl subprocesses while the user
+            # is actively scrolling or holding navigation keys.
+            if now - last_input_time < BACKGROUND_IDLE_DELAY:
                 continue
 
             changed = False
@@ -2266,6 +2372,7 @@ def main():
 
             if changed:
                 live.update(build_dashboard(), refresh=True)
+                last_ui_redraw = now
 
     finally:
         # Always turn mouse reporting off, even after Ctrl+C or an exception,
