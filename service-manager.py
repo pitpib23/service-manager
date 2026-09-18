@@ -1,6 +1,7 @@
 import os
 import re
 import select
+import shutil
 import shlex
 import subprocess
 import sys
@@ -61,6 +62,8 @@ last_error_refresh = 0.0
 last_log_refresh = 0.0
 selected_error_text = "Loading..."
 selected_log_text = "Loading..."
+detail_scroll_offset = 0
+log_scroll_offset = 0
 
 
 def run_command(command, timeout=5):
@@ -531,6 +534,8 @@ def reset_selected_journal_cache():
     last_log_refresh = 0.0
     selected_error_text = "Loading..."
     selected_log_text = "Loading..."
+detail_scroll_offset = 0
+log_scroll_offset = 0
 
 
 def refresh_selected_error(force=False):
@@ -1406,16 +1411,90 @@ def format_startup_state(state):
     return f"[bright_white]{state}[/bright_white]"
 
 
+def get_terminal_size_safe():
+    """Return terminal (columns, lines) with a safe fallback."""
+
+    size = shutil.get_terminal_size(fallback=(120, 30))
+    return size.columns, size.lines
+
+
+def is_short_display():
+    _, height = get_terminal_size_safe()
+    return height < 38
+
+
+def get_max_visible_services():
+    """
+    Keep the service list small enough that the details panel and footer
+    always remain visible on short Raspberry Pi / VNC terminals.
+    """
+
+    _, height = get_terminal_size_safe()
+
+    if height <= 24:
+        return 2
+    if height <= 28:
+        return 3
+    if height <= 32:
+        return 4
+    if height <= 36:
+        return 5
+    if height <= 42:
+        return 7
+    return MAX_VISIBLE_SERVICES
+
+
+def get_footer_height():
+    width, _ = get_terminal_size_safe()
+    return 2 if width >= 118 else 3
+
+
+def get_detail_view_height():
+    """
+    Number of content rows available inside Service Details / Logs.
+
+    Rich's panel borders and the service table consume real terminal rows,
+    so reserve them explicitly instead of letting the footer fall below the
+    screen.
+    """
+
+    _, height = get_terminal_size_safe()
+    service_rows = min(len(services), get_max_visible_services()) if services else 1
+
+    # Service panel = data rows + table header + panel top/bottom borders.
+    service_panel_height = service_rows + 3
+
+    # One blank between panels, one before footer, plus detail panel borders.
+    fixed_rows = (
+        service_panel_height
+        + 1
+        + 2
+        + 1
+        + get_footer_height()
+    )
+
+    available = height - fixed_rows
+
+    # Always leave a useful details window, but cap it so very tall terminals
+    # do not make the dashboard unnecessarily large.
+    return max(4, min(20, available))
+
+
 def get_visible_range():
     total = len(services)
-    if total <= MAX_VISIBLE_SERVICES:
+    max_visible = get_max_visible_services()
+
+    if total <= max_visible:
         return 0, total
-    half = MAX_VISIBLE_SERVICES // 2
+
+    half = max_visible // 2
     start = max(0, selected_index - half)
-    end = start + MAX_VISIBLE_SERVICES
+    end = start + max_visible
+
     if end > total:
         end = total
-        start = max(0, end - MAX_VISIBLE_SERVICES)
+        start = max(0, end - max_visible)
+
     return start, end
 
 
@@ -1507,7 +1586,23 @@ def build_empty_panel():
     return Panel(text, title="Services", border_style="white")
 
 
-def build_detail_panel(service):
+def make_detail_line(label=None, value="", label_style="bold bright_white", value_style="bright_white"):
+    """Create one no-wrap detail line so panel height stays predictable."""
+
+    line = Text(no_wrap=True, overflow="ellipsis")
+    if label is not None:
+        line.append(f"{label}: ", style=label_style)
+    line.append(str(value), style=value_style)
+    return line
+
+
+def make_plain_detail_line(value="", style="bright_white"):
+    return Text(str(value), style=style, no_wrap=True, overflow="ellipsis")
+
+
+def build_detail_lines(service):
+    """Build all Service Details rows before applying the scroll window."""
+
     info = get_service_info(service)
     relation = get_service_relation(service)
     state = info.get("ActiveState", "unknown")
@@ -1519,111 +1614,269 @@ def build_detail_panel(service):
     if pid in {"", "0"}:
         pid = "-"
 
-    conflict_text = ""
+    lines = [make_detail_line("Selected", service)]
+
+    if canonical and canonical != service and relation != "conflict":
+        lines.append(make_detail_line("Canonical", canonical))
+
+    metadata = service_metadata.get(service, {})
+    entry_path = metadata.get("path", "-")
+    lines.append(make_detail_line("File", entry_path))
+
+    if metadata.get("is_symlink"):
+        lines.append(make_detail_line("Symlink", "Yes", value_style="bright_cyan"))
+        lines.append(make_detail_line("Link source", metadata.get("link_source") or "-"))
+        lines.append(make_detail_line("Resolved", metadata.get("resolved_target") or "-"))
+    else:
+        lines.append(make_detail_line("Symlink", "No"))
+
     if relation == "conflict":
         selected_real = get_service_file_path(service)
         fragment = get_systemd_fragment_path(service)
-        state_text = "[bold bright_red]Name conflict[/bold bright_red]"
-        startup_text = "-"
-        exec_start = "-"
-        pid = "-"
-        conflict_text = (
-            "\n[bold bright_red]Conflict:[/bold bright_red] systemd is using a different file\n"
-            f"[bold bright_white]Selected file:[/bold bright_white] {selected_real or '-'}\n"
-            f"[bold bright_white]Systemd file:[/bold bright_white] {fragment or '-'}"
-        )
+        lines.append(make_plain_detail_line(""))
+        lines.append(make_detail_line("Status", "Name conflict", value_style="bold bright_red"))
+        lines.append(make_detail_line("Selected file", selected_real or "-"))
+        lines.append(make_detail_line("Systemd file", fragment or "-"))
+        lines.append(make_detail_line("Startup", "-"))
+        lines.append(make_detail_line("Load state", load_state))
+        lines.append(make_detail_line("PID", "-"))
+        lines.append(make_detail_line("Memory", "-"))
+        lines.append(make_detail_line("Restarts", "-"))
+        lines.append(make_detail_line("Started", "-"))
+        lines.append(make_detail_line("ExecStart", "-"))
     else:
         if load_state == "not-found":
-            state_text = "[bright_magenta]Not installed[/bright_magenta]"
+            display_state = "Not installed"
+            display_state_style = "bright_magenta"
         elif state == "active":
-            state_text = "[bright_green]Running[/bright_green]"
+            display_state = "Running"
+            display_state_style = "bright_green"
         elif state == "failed":
-            state_text = "[bright_red]Failed[/bright_red]"
+            display_state = "Failed"
+            display_state_style = "bright_red"
         elif state == "inactive":
-            state_text = "[bright_yellow]Stopped[/bright_yellow]"
+            display_state = "Stopped"
+            display_state_style = "bright_yellow"
         else:
-            state_text = state
-        startup_text = format_startup_state(startup_state)
+            display_state = state
+            display_state_style = "bright_white"
 
-    canonical_text = ""
-    if canonical and canonical != service and relation != "conflict":
-        canonical_text = f"[bold bright_white]Canonical:[/bold bright_white] {canonical}\n"
+        startup_display = startup_state or "-"
+        startup_style = "bright_white"
+        if startup_state in {"enabled", "enabled-runtime"}:
+            startup_display = "Enabled" if startup_state == "enabled" else "Enabled (runtime)"
+            startup_style = "bright_green"
+        elif startup_state == "disabled":
+            startup_display = "Disabled"
+            startup_style = "bright_yellow"
+        elif startup_state == "masked":
+            startup_display = "Masked"
+            startup_style = "bright_red"
 
-    content = (
-        f"[bold bright_white]Selected:[/bold bright_white] {service}\n"
-        f"{canonical_text}"
-        f"{build_symlink_details(service)}"
-        f"{conflict_text}"
-        f"\n\n"
-        f"[bold bright_white]Status:[/bold bright_white] {state_text}\n"
-        f"[bold bright_white]Startup:[/bold bright_white] {startup_text}\n"
-        f"[bold bright_white]Load state:[/bold bright_white] {load_state}\n"
-        f"[bold bright_white]PID:[/bold bright_white] {pid}\n"
-        f"[bold bright_white]Memory:[/bold bright_white] {format_memory(get_service_memory(info)) if relation != 'conflict' else '-'}\n"
-        f"[bold bright_white]Restarts:[/bold bright_white] {info.get('NRestarts', '0') if relation != 'conflict' else '-'}\n"
-        f"[bold bright_white]Started:[/bold bright_white] {format_start_time(info.get('ActiveEnterTimestamp', '')) if relation != 'conflict' else '-'}\n"
-        f"[bold bright_white]ExecStart:[/bold bright_white] {exec_start}"
-        f"\n\n"
-        f"[bold bright_white]Last error:[/bold bright_white]\n"
-        f"{selected_error_text}"
+        lines.append(make_plain_detail_line(""))
+        lines.append(make_detail_line("Status", display_state, value_style=display_state_style))
+        lines.append(make_detail_line("Startup", startup_display, value_style=startup_style))
+        lines.append(make_detail_line("Load state", load_state))
+        lines.append(make_detail_line("PID", pid))
+        lines.append(make_detail_line("Memory", format_memory(get_service_memory(info))))
+        lines.append(make_detail_line("Restarts", info.get("NRestarts", "0")))
+        lines.append(make_detail_line("Started", format_start_time(info.get("ActiveEnterTimestamp", ""))))
+        lines.append(make_detail_line("ExecStart", exec_start))
+
+    lines.append(make_plain_detail_line(""))
+    lines.append(make_plain_detail_line("Last error:", style="bold bright_white"))
+
+    error_lines = (selected_error_text or "-").splitlines() or ["-"]
+    for error_line in error_lines:
+        lines.append(make_plain_detail_line(error_line))
+
+    # Keep the latest action inside the scrollable details area. This means
+    # enable-created symlinks remain inspectable without a separate panel
+    # pushing the footer off a short screen.
+    if status_message:
+        lines.append(make_plain_detail_line(""))
+        lines.append(make_plain_detail_line("Last action:", style="bold bright_cyan"))
+        lines.append(make_plain_detail_line(status_message, style="bold bright_white"))
+        for detail in status_details:
+            style = "bright_white"
+            if detail in {"Created symlinks:", "Removed symlinks:"}:
+                style = "bold bright_cyan"
+            elif detail.startswith("Warning:") or detail.startswith("Action blocked:"):
+                style = "yellow"
+            lines.append(make_plain_detail_line(detail, style=style))
+
+    return lines
+
+
+def get_max_scroll(total_lines, viewport_height):
+    return max(0, total_lines - viewport_height)
+
+
+def clamp_detail_scroll(service=None):
+    global detail_scroll_offset
+
+    if not services:
+        detail_scroll_offset = 0
+        return
+
+    if service is None:
+        service = services[selected_index]
+
+    total = len(build_detail_lines(service))
+    viewport = get_detail_view_height()
+    detail_scroll_offset = max(
+        0,
+        min(detail_scroll_offset, get_max_scroll(total, viewport)),
     )
 
-    return Panel(content, title="Service Details", border_style="white")
+
+def build_detail_panel(service):
+    global detail_scroll_offset
+
+    lines = build_detail_lines(service)
+    viewport = get_detail_view_height()
+    max_offset = get_max_scroll(len(lines), viewport)
+    detail_scroll_offset = max(0, min(detail_scroll_offset, max_offset))
+
+    start = detail_scroll_offset
+    end = min(len(lines), start + viewport)
+    visible = lines[start:end]
+
+    body = Group(*visible) if visible else Text("-")
+
+    subtitle = Text()
+    if len(lines) > viewport:
+        subtitle.append(
+            f"{start + 1}-{end}/{len(lines)}  ",
+            style="white",
+        )
+    subtitle.append("Wheel/PgUp/PgDn", style="bold bright_cyan")
+    subtitle.append(" Scroll  ", style="white")
+    subtitle.append("Home/End", style="bold bright_cyan")
+    subtitle.append(" Top/Bottom", style="white")
+
+    return Panel(
+        body,
+        title="Service Details",
+        subtitle=subtitle,
+        border_style="white",
+        padding=(0, 1),
+    )
+
+
+def get_log_lines():
+    raw_lines = (selected_log_text or "No logs available").splitlines()
+    if not raw_lines:
+        raw_lines = ["No logs available"]
+    return [make_plain_detail_line(line) for line in raw_lines]
+
+
+def clamp_log_scroll():
+    global log_scroll_offset
+
+    lines = get_log_lines()
+    viewport = get_detail_view_height()
+    log_scroll_offset = max(
+        0,
+        min(log_scroll_offset, get_max_scroll(len(lines), viewport)),
+    )
 
 
 def build_logs_panel(service):
+    global log_scroll_offset
+
+    lines = get_log_lines()
+    viewport = get_detail_view_height()
+    max_offset = get_max_scroll(len(lines), viewport)
+    log_scroll_offset = max(0, min(log_scroll_offset, max_offset))
+
+    start = log_scroll_offset
+    end = min(len(lines), start + viewport)
+    visible = lines[start:end]
+
     subtitle = Text()
+    if len(lines) > viewport:
+        subtitle.append(f"{start + 1}-{end}/{len(lines)}  ", style="white")
+    subtitle.append("Wheel/PgUp/PgDn", style="bold bright_cyan")
+    subtitle.append(" Scroll  ", style="white")
+    subtitle.append("Home/End", style="bold bright_cyan")
+    subtitle.append(" Top/Bottom  ", style="white")
     subtitle.append("[l]", style="bold bright_cyan")
-    subtitle.append(" Back to details", style="white")
+    subtitle.append(" Details", style="white")
+
     return Panel(
-        Text(selected_log_text, style="bright_white"),
+        Group(*visible),
         title=f"Logs: {service}",
         subtitle=subtitle,
         border_style="white",
+        padding=(0, 1),
     )
 
 
-def build_status_panel():
-    if not status_message:
-        return None
-    text = Text()
-    text.append(status_message, style="bold bright_white")
-    for detail in status_details:
-        text.append("\n")
-        if detail in {"Created symlinks:", "Removed symlinks:"}:
-            text.append(detail, style="bold bright_cyan")
-        elif detail.startswith("Warning:") or detail.startswith("Action blocked:"):
-            text.append(detail, style="yellow")
-        else:
-            text.append(detail, style="bright_white")
-    return Panel(text, title="Last Action", border_style="bright_cyan")
-
-
 def build_footer():
+    width, _ = get_terminal_size_safe()
     footer = Text()
-    shortcuts = [
-        ("[↑/↓]", " Select   "),
-        ("[d]", " Source   "),
-        ("[c]", " Create   "),
-        ("[D]", " Delete   "),
-        ("[e]", " Enable   "),
-        ("[E]", " Disable   "),
-        ("[r]", " Restart   "),
-        ("[s]", " Start   "),
-        ("[x]", " Stop   "),
-        ("[g]", " Daemon Reload   "),
-        ("[f]", " Refresh   "),
-        ("[l]", " Logs   "),
-        ("[q]", " Quit"),
-    ]
-    for key, label in shortcuts:
-        footer.append(key, style="bold bright_cyan")
-        footer.append(label, style="bright_white")
+
+    # Navigation line: explicitly documents the requested mouse/keyboard
+    # scrolling controls.
+    footer.append("[↑/↓]", style="bold bright_cyan")
+    footer.append(" Select   ", style="bright_white")
+    footer.append("[Wheel/PgUp/PgDn]", style="bold bright_cyan")
+    footer.append(" Scroll   ", style="bright_white")
+    footer.append("[Home/End]", style="bold bright_cyan")
+    footer.append(" Top/Bottom", style="bright_white")
+    footer.append("\n")
+
+    if width >= 118:
+        actions = [
+            ("[s]", " Start  "),
+            ("[x]", " Stop  "),
+            ("[r]", " Restart  "),
+            ("[e]", " Enable  "),
+            ("[E]", " Disable  "),
+            ("[c]", " Create  "),
+            ("[D]", " Delete  "),
+            ("[d]", " Source  "),
+            ("[g]", " Reload  "),
+            ("[l]", " Logs  "),
+            ("[f]", " Refresh  "),
+            ("[q]", " Quit"),
+        ]
+        for key, label in actions:
+            footer.append(key, style="bold bright_cyan")
+            footer.append(label, style="bright_white")
+    else:
+        row2 = [
+            ("[s]", " Start  "),
+            ("[x]", " Stop  "),
+            ("[r]", " Restart  "),
+            ("[e]", " Enable  "),
+            ("[E]", " Disable  "),
+            ("[l]", " Logs"),
+        ]
+        for key, label in row2:
+            footer.append(key, style="bold bright_cyan")
+            footer.append(label, style="bright_white")
+        footer.append("\n")
+
+        row3 = [
+            ("[c]", " Create  "),
+            ("[D]", " Delete  "),
+            ("[d]", " Source  "),
+            ("[g]", " Reload  "),
+            ("[f]", " Refresh  "),
+            ("[q]", " Quit"),
+        ]
+        for key, label in row3:
+            footer.append(key, style="bold bright_cyan")
+            footer.append(label, style="bright_white")
+
     return footer
 
 
 def build_dashboard():
     elements = []
+
     if services:
         elements.append(build_service_table())
         elements.append("")
@@ -1631,62 +1884,205 @@ def build_dashboard():
         elements.append(build_logs_panel(service) if show_logs else build_detail_panel(service))
     else:
         elements.append(build_empty_panel())
-
-    status_panel = build_status_panel()
-    if status_panel:
-        elements.append("")
-        elements.append(status_panel)
+        if status_message:
+            elements.append("")
+            elements.append(make_plain_detail_line(f"Last action: {status_message}"))
 
     elements.append("")
     elements.append(build_footer())
     return Group(*elements)
 
 
+def enable_mouse_reporting():
+    """
+    Ask xterm-compatible terminals to report mouse button/wheel events using
+    SGR coordinates. RealVNC's Raspberry Pi terminal normally supports this.
+    """
+
+    try:
+        sys.stdout.write("\x1b[?1000h\x1b[?1006h")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def disable_mouse_reporting():
+    try:
+        sys.stdout.write("\x1b[?1006l\x1b[?1000l")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def parse_escape_sequence(sequence):
+    """Translate an ANSI escape sequence into a dashboard input event."""
+
+    key_map = {
+        b"\x1b[A": "UP",
+        b"\x1b[B": "DOWN",
+        b"\x1b[5~": "PAGE_UP",
+        b"\x1b[6~": "PAGE_DOWN",
+        b"\x1b[H": "HOME",
+        b"\x1b[1~": "HOME",
+        b"\x1b[7~": "HOME",
+        b"\x1b[F": "END",
+        b"\x1b[4~": "END",
+        b"\x1b[8~": "END",
+    }
+
+    if sequence in key_map:
+        return key_map[sequence]
+
+    # SGR mouse report: ESC [ < button ; x ; y M
+    match = re.fullmatch(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])", sequence)
+    if match:
+        button_code = int(match.group(1))
+
+        # Wheel bit is 64. Low two bits distinguish up/down. Modifier bits
+        # (Shift/Alt/Ctrl) can be present, so do not compare exact numbers.
+        if button_code & 64:
+            wheel_button = button_code & 3
+            if wheel_button == 0:
+                return "WHEEL_UP"
+            if wheel_button == 1:
+                return "WHEEL_DOWN"
+
+        return "MOUSE"
+
+    return "ESC"
+
+
 def read_key(timeout=0.08):
+    """Read keyboard keys and SGR mouse-wheel reports from the terminal."""
+
     readable, _, _ = select.select([sys.stdin], [], [], timeout)
     if not readable:
         return None
+
     fd = sys.stdin.fileno()
     first = os.read(fd, 1)
+
     if first == b"\x1b":
-        sequence = first
-        deadline = time.monotonic() + 0.03
-        while len(sequence) < 3 and time.monotonic() < deadline:
+        sequence = bytearray(first)
+        deadline = time.monotonic() + 0.06
+
+        while len(sequence) < 64 and time.monotonic() < deadline:
+            # Known keyboard sequences can be returned immediately.
+            current = bytes(sequence)
+            if current in {
+                b"\x1b[A", b"\x1b[B",
+                b"\x1b[5~", b"\x1b[6~",
+                b"\x1b[H", b"\x1b[F",
+                b"\x1b[1~", b"\x1b[4~",
+                b"\x1b[7~", b"\x1b[8~",
+            }:
+                break
+
+            # Complete SGR mouse sequences end in M or m.
+            if current.startswith(b"\x1b[<") and current[-1:] in {b"M", b"m"}:
+                break
+
             remaining = max(0, deadline - time.monotonic())
             ready, _, _ = select.select([sys.stdin], [], [], remaining)
             if not ready:
                 break
-            sequence += os.read(fd, 1)
-        if sequence == b"\x1b[A":
-            return "UP"
-        if sequence == b"\x1b[B":
-            return "DOWN"
-        return "ESC"
+
+            sequence.extend(os.read(fd, 1))
+
+        return parse_escape_sequence(bytes(sequence))
+
     try:
+        # Preserve uppercase: D=Delete and E=Disable.
         return first.decode("utf-8")
     except UnicodeDecodeError:
         return None
 
 
+def scroll_current_view(event):
+    """Scroll details (or logs when logs are open) without moving selection."""
+
+    global detail_scroll_offset, log_scroll_offset
+
+    viewport = get_detail_view_height()
+
+    if show_logs:
+        lines = get_log_lines()
+        max_offset = get_max_scroll(len(lines), viewport)
+        offset = log_scroll_offset
+    else:
+        if not services:
+            return
+        lines = build_detail_lines(services[selected_index])
+        max_offset = get_max_scroll(len(lines), viewport)
+        offset = detail_scroll_offset
+
+    if event == "WHEEL_UP":
+        offset -= 2
+    elif event == "WHEEL_DOWN":
+        offset += 2
+    elif event == "PAGE_UP":
+        offset -= max(1, viewport - 1)
+    elif event == "PAGE_DOWN":
+        offset += max(1, viewport - 1)
+    elif event == "HOME":
+        offset = 0
+    elif event == "END":
+        offset = max_offset
+
+    offset = max(0, min(offset, max_offset))
+
+    if show_logs:
+        log_scroll_offset = offset
+    else:
+        detail_scroll_offset = offset
+
+
+def reset_view_scroll():
+    global detail_scroll_offset, log_scroll_offset
+    detail_scroll_offset = 0
+    log_scroll_offset = 0
+
+
 def handle_key(key):
     global selected_index, show_logs, status_message, status_details
     global last_status_refresh, last_log_refresh, selected_log_text
+    global detail_scroll_offset, log_scroll_offset
+
+    # Mouse wheel / paging controls scroll the current content panel and do
+    # not change the selected service.
+    if key in {
+        "WHEEL_UP", "WHEEL_DOWN",
+        "PAGE_UP", "PAGE_DOWN",
+        "HOME", "END",
+    }:
+        scroll_current_view(key)
+        return True
+
+    # Non-wheel mouse clicks are intentionally ignored.
+    if key == "MOUSE":
+        return True
 
     if key == "E":
         if services:
             control_service(services[selected_index], "disable")
+            clamp_detail_scroll()
         return True
 
     normalized = key if key in {"UP", "DOWN", "ESC"} else key.lower()
 
     if normalized == "q":
         return False
+
     if normalized == "d":
         switch_service_source()
+        reset_view_scroll()
         return True
+
     if normalized == "g":
         dashboard_daemon_reload()
+        clamp_detail_scroll()
         return True
+
     if normalized == "f":
         status_details = []
         refresh_service_list(force=True)
@@ -1694,6 +2090,7 @@ def handle_key(key):
         refresh_service_data(force=True)
         reset_selected_journal_cache()
         status_message = "Refreshed"
+        clamp_detail_scroll()
         return True
 
     if not services:
@@ -1702,12 +2099,14 @@ def handle_key(key):
     if normalized == "UP":
         selected_index = (selected_index - 1) % len(services)
         show_logs = False
+        reset_view_scroll()
         reset_selected_journal_cache()
         return True
 
     if normalized == "DOWN":
         selected_index = (selected_index + 1) % len(services)
         show_logs = False
+        reset_view_scroll()
         reset_selected_journal_cache()
         return True
 
@@ -1715,30 +2114,44 @@ def handle_key(key):
 
     if normalized == "e":
         control_service(service, "enable")
+        clamp_detail_scroll()
         return True
+
     if normalized == "l":
         show_logs = not show_logs
         if show_logs:
             selected_log_text = "Loading..."
             last_log_refresh = 0.0
+            log_scroll_offset = 0
+        else:
+            detail_scroll_offset = 0
         return True
+
     if normalized == "r":
         control_service(service, "restart")
+        clamp_detail_scroll()
         return True
+
     if normalized == "s":
         control_service(service, "start")
+        clamp_detail_scroll()
         return True
+
     if normalized == "x":
         control_service(service, "stop")
+        clamp_detail_scroll()
         return True
 
     return True
-
 
 def run_modal_action(live, console, fd, normal_settings, action):
     global status_message, status_details
     global last_status_refresh, last_service_list_refresh
 
+    # Mouse reporting is only useful inside the full-screen dashboard. Disable
+    # it before normal input() prompts so wheel/click escape sequences cannot
+    # leak into service names or paths.
+    disable_mouse_reporting()
     live.stop()
     termios.tcsetattr(fd, termios.TCSADRAIN, normal_settings)
     console.clear()
@@ -1765,6 +2178,7 @@ def run_modal_action(live, console, fd, normal_settings, action):
     refresh_service_list(force=True)
     refresh_service_data(force=True)
     reset_selected_journal_cache()
+    reset_view_scroll()
 
     try:
         termios.tcflush(fd, termios.TCIFLUSH)
@@ -1774,6 +2188,7 @@ def run_modal_action(live, console, fd, normal_settings, action):
     tty.setcbreak(fd)
     live.update(build_dashboard(), refresh=False)
     live.start(refresh=True)
+    enable_mouse_reporting()
 
 
 def main():
@@ -1799,6 +2214,12 @@ def main():
     try:
         tty.setcbreak(fd)
         live.start(refresh=True)
+
+        # Enable SGR mouse-wheel reporting after Rich has entered the alternate
+        # screen buffer. This lets the wheel scroll Service Details instead of
+        # trying to scroll the terminal's unavailable alternate-screen history.
+        enable_mouse_reporting()
+
         running = True
 
         while running:
@@ -1813,7 +2234,10 @@ def main():
                     continue
 
                 if (
-                    key not in {"UP", "DOWN", "ESC"}
+                    key not in {
+                        "UP", "DOWN", "ESC", "PAGE_UP", "PAGE_DOWN",
+                        "HOME", "END", "WHEEL_UP", "WHEEL_DOWN", "MOUSE",
+                    }
                     and key.lower() == "c"
                 ):
                     run_modal_action(
@@ -1834,14 +2258,20 @@ def main():
             if show_logs:
                 if refresh_selected_logs():
                     changed = True
+                    clamp_log_scroll()
             else:
                 if refresh_selected_error():
                     changed = True
+                    clamp_detail_scroll()
 
             if changed:
                 live.update(build_dashboard(), refresh=True)
 
     finally:
+        # Always turn mouse reporting off, even after Ctrl+C or an exception,
+        # otherwise the user's shell may continue receiving mouse escape codes.
+        disable_mouse_reporting()
+
         try:
             live.stop()
         except Exception:
